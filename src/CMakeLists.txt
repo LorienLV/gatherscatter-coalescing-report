@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(GatherScatterPrinter)
+project(GatherScatterCoalescingCount)
 
 # Set CMake policies
 set(CMAKE_C_STANDARD 11)
@@ -31,16 +31,15 @@ message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 # Find DynamoRIO
 find_package(DynamoRIO REQUIRED)
 
-set(LIBRARY_NAME "gatherscatter_printer")
+set(LIBRARY_NAME "gatherscatter_coalescing_count")
 
 # Add the source file to the build
 add_library(${LIBRARY_NAME} MODULE
-    gatherscatter_printer.c
+    gatherscatter_coalescing_count.c
 )
 
 # Configure DynamoRIO client
 configure_DynamoRIO_client(${LIBRARY_NAME})
-use_DynamoRIO_extension(${LIBRARY_NAME} drmgr)
 use_DynamoRIO_extension(${LIBRARY_NAME} drreg)
 use_DynamoRIO_extension(${LIBRARY_NAME} drutil)
 use_DynamoRIO_extension(${LIBRARY_NAME} drx)

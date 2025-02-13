@@ -33,9 +33,10 @@
  */
 
 /* Code Manipulation API Sample:
- * memtrace_simple.c modified to print gather and scatter instructions.
+ * memtrace_simple.c modified to print the coalescing of gather and scatter
+ * instruction.
  *
- * Collects the memory reference information and dumps it to a file as text.
+ * // TODO:
  *
  * (1) It fills a per-thread-buffer with inlined instrumentation.
  * (2) It calls a clean call to dump the buffer into a file.
@@ -69,7 +70,6 @@
 #include <string.h>
 
 #include "dr_api.h"
-#include "drmgr.h"
 #include "drreg.h"
 #include "drutil.h"
 #include "drx.h"
@@ -78,12 +78,6 @@ enum {
     REF_TYPE_READ = 0,
     REF_TYPE_WRITE = 1,
 };
-
-typedef enum {
-    GATHER,
-    SCATTER,
-    OTHER
-} instr_type;
 
 /* Each mem_ref_t is a <type, size, addr> entry representing a memory reference
  * instruction or the reference information, e.g.:
@@ -103,17 +97,26 @@ typedef struct _mem_ref_t {
 /* The maximum size of buffer for holding mem_refs. */
 #define MEM_BUF_SIZE (sizeof(mem_ref_t) * MAX_NUM_MEM_REFS)
 
+#define MAX_CLINES_PER_GATSCAT 512
+
 /* thread private log file and counter */
 typedef struct {
+    // TLS buffer to hold the instrs and their mem refs.
     byte *seg_base;
     mem_ref_t *buf_base;
-    instr_type last_instr_type;
-    uint64 ngatscat;
+
+    uint64 *ngats_that_access_nlines;
+    uint64 *nscats_that_access_nlines;
+
+    bool last_inst_was_gatscat;
 } per_thread_t;
 
 static client_id_t client_id;
 static void *mutex;        /* for multithread support */
-static uint64 ngatscat;    /* keep a global memory reference count */
+
+// Global version of per thread counters.
+static uint64 *ngats_that_access_nlines;
+static uint64 *nscats_that_access_nlines;;
 
 /* Allocated TLS slot offsets */
 enum {
@@ -131,42 +134,74 @@ static int tls_idx;
 
 #define MINSERT instrlist_meta_preinsert
 
-static void memtrace(void *drcontext) {
-    per_thread_t *data;
-    mem_ref_t *mem_ref, *buf_ptr;
+static int cline_bytes = 64;
 
-    data = drmgr_get_tls_field(drcontext, tls_idx);
-    buf_ptr = BUF_PTR(data->seg_base);
-    /* Example of dumpped file content:
-     *   0x00007f59c2d002d3:  5, call
-     *   0x00007ffeacab0ec8:  8, w
-     */
-    /* We use libc's fprintf as it is buffered and much faster than dr_fprintf
-     * for repeated printing that dominates performance, as the printing does
-     * here.
-     */
-    for (mem_ref = (mem_ref_t *)data->buf_base; mem_ref < buf_ptr; mem_ref++) {
-        /* We use PIFX to avoid leading zeroes and shrink the resulting file. */
-        // fprintf(data->logf,
-        //         "" PIFX ": %2d, %s\n",
-        //         (ptr_uint_t)mem_ref->addr,
-        //         mem_ref->size,
-        //         (mem_ref->type > REF_TYPE_WRITE)
-        //             ? decode_opcode_name(mem_ref->type) /* opcode for instr */
-        //             : (mem_ref->type == REF_TYPE_WRITE ? "w" : "r"));
-        // data-logf crashes. Use dr_fprintf instead.
-        bool is_inst = mem_ref->type > REF_TYPE_WRITE;
-        dr_fprintf(STDERR,
-                   "%s" PIFX ": %2d, %s\n",
-                   (is_inst) ? "INST " : "MEM  ",
-                   (ptr_uint_t)mem_ref->addr,
-                   mem_ref->size,
-                   (is_inst) ? decode_opcode_name(mem_ref->type) /* opcode for
-                                                                    instr */
-                             : (mem_ref->type == REF_TYPE_WRITE ? "w" : "r"));
+static void bubble_sort_memrefs(mem_ref_t *const mem_refs, const int num_mrefs) {
+    for (int i = 0; i < num_mrefs - 1; i++) {
+        bool swapped = false;
+        for (int j = 0; j < num_mrefs - i - 1; j++) {
+            if (mem_refs[j].addr > mem_refs[j + 1].addr) {
+                mem_ref_t tmp = mem_refs[j];
+                mem_refs[j] = mem_refs[j + 1];
+                mem_refs[j + 1] = tmp;
+            }
+        }
 
-        data->ngatscat++;
+        if (!swapped) { // No need to continue.
+            break;
+        }
     }
+}
+
+// Function to count unique elements
+static int count_unique_memrefs(mem_ref_t *const mem_refs, const int num_mrefs) {
+    if (num_mrefs == 0) {
+        return 0;
+    }
+
+    bubble_sort_memrefs(mem_refs, num_mrefs);
+
+    int count = 1;
+    for (int i = 1; i < num_mrefs; i++) {
+        if (mem_refs[i].addr != mem_refs[i - 1].addr) {
+            count++;
+        }
+    }
+
+    return count;
+}
+
+static void memtrace(void *drcontext) {
+    per_thread_t *data = drmgr_get_tls_field(drcontext, tls_idx);
+    mem_ref_t *buf_ptr = BUF_PTR(data->seg_base);
+
+    const bool empty_buffer = buf_ptr == data->buf_base;
+    if (empty_buffer) {
+        return;
+    }
+
+    // The first element in the buffer is the instruction.
+    mem_ref_t* instr = (mem_ref_t*)data->buf_base;
+
+    const bool is_gather = instr->type == REF_TYPE_READ;
+
+    uint64 *count_vector = is_gather ? data->ngats_that_access_nlines
+                                     : data->nscats_that_access_nlines;
+
+    mem_ref_t *first_ref = ((mem_ref_t *)data->buf_base) + 1;
+
+    // Iterate over the memory references and set the address to the cache line.
+    for (mem_ref_t *mem_ref = first_ref; mem_ref < buf_ptr; mem_ref++) {
+        ptr_uint_t addr = (ptr_uint_t)mem_ref->addr;
+        addr /= cline_bytes;
+        mem_ref->addr = (app_pc)addr;
+    }
+
+    // Count the number of different memory addresses.
+    int nlines_accessed = count_unique_memrefs(first_ref, buf_ptr - first_ref);
+    count_vector[nlines_accessed]++;
+
+    // Reset the buffer.
     BUF_PTR(data->seg_base) = data->buf_base;
 }
 
@@ -272,9 +307,8 @@ static void insert_save_addr(void *drcontext,
                              opnd_t ref,
                              reg_id_t reg_ptr,
                              reg_id_t reg_addr) {
-    bool ok;
     /* we use reg_ptr as scratch to get addr */
-    ok = drutil_insert_get_mem_addr(drcontext, ilist, where, ref, reg_addr, reg_ptr);
+    bool ok = drutil_insert_get_mem_addr(drcontext, ilist, where, ref, reg_addr, reg_ptr);
     DR_ASSERT(ok);
     insert_load_buf_ptr(drcontext, ilist, where, reg_ptr);
     MINSERT(ilist,
@@ -288,7 +322,8 @@ static void insert_save_addr(void *drcontext,
 static void instrument_instr(void *drcontext,
                              instrlist_t *ilist,
                              instr_t *where,
-                             instr_t *instr) {
+                             instr_t *instr,
+                             bool write) {
     /* We need two scratch registers */
     reg_id_t reg_ptr, reg_tmp;
     /* we don't want to predicate this, because an instruction fetch always
@@ -307,7 +342,7 @@ static void instrument_instr(void *drcontext,
                      where,
                      reg_ptr,
                      reg_tmp,
-                     (ushort)instr_get_opcode(instr));
+                     write ? REF_TYPE_WRITE : REF_TYPE_READ);
     insert_save_size(drcontext,
                      ilist,
                      where,
@@ -370,7 +405,6 @@ static dr_emit_flags_t event_app_instruction(void *drcontext,
                                              bool for_trace,
                                              bool translating,
                                              void *user_data) {
-    int i;
 
     per_thread_t *data = drmgr_get_tls_field(drcontext, tls_idx);
 
@@ -383,48 +417,21 @@ static dr_emit_flags_t event_app_instruction(void *drcontext,
     instr_t *instr_fetch = drmgr_orig_app_instr_for_fetch(drcontext);
 
     if (instr_fetch != NULL) {
-        if (instr_is_gather(instr_fetch)) {
-            data->last_instr_type = GATHER;
-        }
-        else if (instr_is_scatter(instr_fetch)) {
-            data->last_instr_type = SCATTER;
+        if (instr_is_gather(instr_fetch) || instr_is_scatter(instr_fetch)) {
+            data->last_inst_was_gatscat = true;
         }
         else {
-            data->last_instr_type = OTHER;
+            data->last_inst_was_gatscat = false;
             return DR_EMIT_DEFAULT; // Ignore the instruction.
         }
     }
-    else if (data->last_instr_type == OTHER) {
+    // This is a memory reference. We only care about it if it comes from a
+    // gather or scatter.
+    else if (!data->last_inst_was_gatscat) {
         return DR_EMIT_DEFAULT;
     }
 
-    if (instr_fetch != NULL &&
-        (instr_reads_memory(instr_fetch) || instr_writes_memory(instr_fetch))) {
-        DR_ASSERT(instr_is_app(instr_fetch));
-        instrument_instr(drcontext, bb, where, instr_fetch);
-    }
-
-    /* Insert code to add an entry for each memory reference opnd. */
-    instr_t *instr_operands = drmgr_orig_app_instr_for_operands(drcontext);
-    if (instr_operands == NULL || (!instr_reads_memory(instr_operands) &&
-                                   !instr_writes_memory(instr_operands)))
-        return DR_EMIT_DEFAULT;
-    DR_ASSERT(instr_is_app(instr_operands));
-
-    for (i = 0; i < instr_num_srcs(instr_operands); i++) {
-        const opnd_t src = instr_get_src(instr_operands, i);
-        if (opnd_is_memory_reference(src)) {
-            instrument_mem(drcontext, bb, where, src, false);
-        }
-    }
-
-    for (i = 0; i < instr_num_dsts(instr_operands); i++) {
-        const opnd_t dst = instr_get_dst(instr_operands, i);
-        if (opnd_is_memory_reference(dst)) {
-            instrument_mem(drcontext, bb, where, dst, true);
-        }
-    }
-
+    // Before starting with a new instruction, dump the info of the previous one.
     /* insert code to call clean_call for processing the buffer */
     if (/* XXX i#1698: there are constraints for code between ldrex/strex pairs,
          * so we minimize the instrumentation in between by skipping the clean
@@ -436,8 +443,41 @@ static dr_emit_flags_t event_app_instruction(void *drcontext,
          * buffer should be more robust, and the forthcoming buffer filling API
          * (i#513) will provide that.
          */
-        IF_AARCHXX_OR_RISCV64_ELSE(!instr_is_exclusive_store(instr_operands), true))
-        dr_insert_clean_call(drcontext, bb, where, (void *)clean_call, false, 0);
+        instr_fetch != NULL &&
+        IF_AARCHXX_OR_RISCV64_ELSE(!instr_is_exclusive_store(instr_operands), true)) {
+            dr_insert_clean_call(drcontext, bb, where, (void *)clean_call, false, 0);
+    }
+
+    // Instrument the instruction.
+    if (instr_fetch != NULL &&
+        (instr_reads_memory(instr_fetch) || instr_writes_memory(instr_fetch))) {
+        DR_ASSERT(instr_is_app(instr_fetch));
+        instrument_instr(drcontext, bb, where, instr_fetch, instr_is_scatter(instr_fetch));
+    }
+
+    /* Insert code to add an entry for each memory reference opnd. */
+    instr_t *instr_operands = drmgr_orig_app_instr_for_operands(drcontext);
+    if (instr_operands == NULL || (!instr_reads_memory(instr_operands) &&
+                                   !instr_writes_memory(instr_operands))) {
+        return DR_EMIT_DEFAULT;
+    }
+
+    DR_ASSERT(instr_is_app(instr_operands));
+
+    // Instrument memory accesses.
+    for (int i = 0; i < instr_num_srcs(instr_operands); i++) {
+        const opnd_t src = instr_get_src(instr_operands, i);
+        if (opnd_is_memory_reference(src)) {
+            instrument_mem(drcontext, bb, where, src, false);
+        }
+    }
+
+    for (int i = 0; i < instr_num_dsts(instr_operands); i++) {
+        const opnd_t dst = instr_get_dst(instr_operands, i);
+        if (opnd_is_memory_reference(dst)) {
+            instrument_mem(drcontext, bb, where, dst, true);
+        }
+    }
 
     return DR_EMIT_DEFAULT;
 }
@@ -474,11 +514,22 @@ static void event_thread_init(void *drcontext) {
     data->buf_base = dr_raw_mem_alloc(MEM_BUF_SIZE,
                                       DR_MEMPROT_READ | DR_MEMPROT_WRITE,
                                       NULL);
+
+    data->ngats_that_access_nlines = dr_thread_alloc(drcontext,
+                                                     sizeof(uint64) *
+                                                         MAX_CLINES_PER_GATSCAT);
+    data->nscats_that_access_nlines = dr_thread_alloc(drcontext,
+                                                      sizeof(uint64) *
+                                                          MAX_CLINES_PER_GATSCAT);
+
+    for (int i = 0; i < MAX_CLINES_PER_GATSCAT; i++) {
+        data->ngats_that_access_nlines[i] = 0;
+        data->nscats_that_access_nlines[i] = 0;
+    }
+
     DR_ASSERT(data->seg_base != NULL && data->buf_base != NULL);
     /* put buf_base to TLS as starting buf_ptr */
     BUF_PTR(data->seg_base) = data->buf_base;
-
-    data->ngatscat = 0;
 }
 
 static void event_thread_exit(void *drcontext) {
@@ -486,18 +537,48 @@ static void event_thread_exit(void *drcontext) {
     memtrace(drcontext); /* dump any remaining buffer entries */
     data = drmgr_get_tls_field(drcontext, tls_idx);
     dr_mutex_lock(mutex);
-    ngatscat += data->ngatscat;
+
+    for (int i = 0; i < MAX_CLINES_PER_GATSCAT; i++) {
+        ngats_that_access_nlines[i] += data->ngats_that_access_nlines[i];
+        nscats_that_access_nlines[i] += data->nscats_that_access_nlines[i];
+    }
+
     dr_mutex_unlock(mutex);
+
     dr_raw_mem_free(data->buf_base, MEM_BUF_SIZE);
+
+    dr_thread_free(drcontext, data->ngats_that_access_nlines,
+                   sizeof(uint64) * MAX_CLINES_PER_GATSCAT);
+    dr_thread_free(drcontext, data->nscats_that_access_nlines,
+                   sizeof(uint64) * MAX_CLINES_PER_GATSCAT);
+
     dr_thread_free(drcontext, data, sizeof(per_thread_t));
 }
 
 static void event_exit(void) {
-    dr_log(NULL,
-           DR_LOG_ALL,
-           1,
-           "Client 'memtrace' mod num gather/scatter seen: " SZFMT "\n",
-           ngatscat);
+    int last_non_zero = -1;
+    for (int i = MAX_CLINES_PER_GATSCAT - 1; i != -1; --i) {
+        if (ngats_that_access_nlines[i] != 0 || nscats_that_access_nlines[i] != 0) {
+            last_non_zero = i;
+            break;
+        }
+    }
+
+    for (int i = 0; i <= last_non_zero; i++) {
+        dr_fprintf(STDOUT,
+                   "Number of gathers that access %d cache lines: %lu\n",
+                   i,
+                   ngats_that_access_nlines[i]);
+    }
+
+    for (int i = 0; i <= last_non_zero; i++) {
+        dr_fprintf(STDOUT,
+                   "Number of scatters that access %d cache lines: %lu\n",
+                   i,
+                   nscats_that_access_nlines[i]);
+    }
+
+
 
     if (!dr_raw_tls_cfree(tls_offs, MEMTRACE_TLS_COUNT))
         DR_ASSERT(false);
@@ -511,6 +592,10 @@ static void event_exit(void) {
         DR_ASSERT(false);
 
     dr_mutex_destroy(mutex);
+
+    dr_global_free(ngats_that_access_nlines, sizeof(uint64) * MAX_CLINES_PER_GATSCAT);
+    dr_global_free(nscats_that_access_nlines, sizeof(uint64) * MAX_CLINES_PER_GATSCAT);
+
     drutil_exit();
     drmgr_exit();
     drx_exit();
@@ -520,9 +605,28 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char *argv[]) {
     /* We need 2 reg slots beyond drreg's eflags slots => 3 slots */
     drreg_options_t ops = {sizeof(ops), 3, false};
     dr_set_client_name(
-        "DynamoRIO Sample Client 'memtrace' modified to print gather and "
-        "scatter only",
+        "'GatherScatterCoalescingCount' client based on DynamoRIO",
         "https://github.com/LorienLV/gatherscatter-coalescing-count");
+
+    if (argc > 1) {
+        if (argc == 2) {
+            cline_bytes = atoi(argv[1]);
+            dr_fprintf(STDOUT, "Using a cache line size of: %d bytes\n", cline_bytes);
+            if (cline_bytes <= 0) {
+                dr_fprintf(STDERR, "Error: the cache line size must be a positive integer\n");
+                dr_abort();
+            }
+        }
+        else {
+            dr_fprintf(STDERR,
+                       "Error: unknown argument: only the cache line size (in "
+                       "bytes) is supported\n");
+            dr_abort();
+        }
+    }
+    else {
+        dr_fprintf(STDOUT, "Using the default cache line size: %d bytes\n", cline_bytes);
+    }
 
     if (!drmgr_init() || drreg_init(&ops) != DRREG_SUCCESS || !drutil_init() ||
         !drx_init())
@@ -540,6 +644,14 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char *argv[]) {
 
     client_id = id;
     mutex = dr_mutex_create();
+
+    ngats_that_access_nlines = dr_global_alloc(sizeof(uint64) * MAX_CLINES_PER_GATSCAT);
+    nscats_that_access_nlines = dr_global_alloc(sizeof(uint64) * MAX_CLINES_PER_GATSCAT);
+
+    for (int i = 0; i < MAX_CLINES_PER_GATSCAT; i++) {
+        ngats_that_access_nlines[i] = 0;
+        nscats_that_access_nlines[i] = 0;
+    }
 
     tls_idx = drmgr_register_tls_field();
     DR_ASSERT(tls_idx != -1);
