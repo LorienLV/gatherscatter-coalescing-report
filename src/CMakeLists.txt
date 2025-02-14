@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(GatherScatterCoalescingCount)
+project(GatherScatterCoalescingReport)
 
 # Set CMake policies
 set(CMAKE_C_STANDARD 11)
@@ -31,11 +31,11 @@ message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 # Find DynamoRIO
 find_package(DynamoRIO REQUIRED)
 
-set(LIBRARY_NAME "gatherscatter_coalescing_count")
+set(LIBRARY_NAME "gatherscatter_coalescing_report")
 
 # Add the source file to the build
 add_library(${LIBRARY_NAME} MODULE
-    gatherscatter_coalescing_count.c
+    gatherscatter_coalescing_report.c
 )
 
 # Configure DynamoRIO client

@@ -32,24 +32,21 @@
  * DAMAGE.
  */
 
-/* Code Manipulation API Sample:
- * memtrace_simple.c modified to print the coalescing of gather and scatter
- * instruction.
+/*
+ * DynamoRIO's memtrace_simple.c clinet modified report the coalescing of gather
+ * and scatter instruction.
  *
- * // TODO:
+ * (1) It fills a per-thread-buffer with gather and scatter instructions along
+ * with the memory references they access. (2) It calls a clean call to count
+ * how many different cache lines are accessed by each gather and scatter
+ * instruction. (3) It prints a report with the number of gathers and scatters
+ * that access a certain number of cache lines at the end.
  *
- * (1) It fills a per-thread-buffer with inlined instrumentation.
- * (2) It calls a clean call to dump the buffer into a file.
+ * Each gather or scatter instruction is stored in the buffer as an instruction
+ * entry followed by a sequence of loads and stores performed by that
+ * instruction, if any.
  *
- * The profile consists of list of <type, size, addr> entries representing
- * - mem ref instr: e.g., { type = 42 (call), size = 5, addr = 0x7f59c2d002d3 }
- * - mem ref info:  e.g., { type = 1 (write), size = 8, addr = 0x7ffeacab0ec8 }.
- *
- * Each gather or scatter instruction is output as an instruction entry
- * followed by a sequence of loads and stores performed by that instruction, if
- * any.
- *
- * This sample illustrates
+ * This sample uses the following DynamoRIO features:
  * - the use of drutil_expand_rep_string() to expand string loops to obtain
  *   every memory reference;
  * - the use of drx_expand_scatter_gather() to expand scatter/gather instrs
@@ -60,9 +57,7 @@
  *   the address of each memory reference.
  *
  * This client is a simple implementation of a memory reference tracing tool
- * without instrumentation optimization.  Additionally, dumping as
- * text is much slower than dumping as binary.  See memtrace_x86.c for
- * a higher-performance sample.
+ * without instrumentation optimization.
  */
 
 #include <stddef.h> /* for offsetof */
@@ -81,7 +76,7 @@ enum {
 
 /* Each mem_ref_t is a <type, size, addr> entry representing a memory reference
  * instruction or the reference information, e.g.:
- * - mem ref instr: { type = 42 (call), size = 5, addr = 0x7f59c2d002d3 }
+ * - mem ref instr: { type = 0 (gather), size = 5, addr = 0x7f59c2d002d3 }
  * - mem ref info:  { type = 1 (write), size = 8, addr = 0x7ffeacab0ec8 }
  */
 typedef struct _mem_ref_t {
@@ -99,7 +94,7 @@ typedef struct _mem_ref_t {
 
 #define MAX_CLINES_PER_GATSCAT 512
 
-/* thread private log file and counter */
+/* thread private buffer and counters */
 typedef struct {
     // TLS buffer to hold the instrs and their mem refs.
     byte *seg_base;
@@ -134,8 +129,10 @@ static int tls_idx;
 
 #define MINSERT instrlist_meta_preinsert
 
+// The cache line size in bytes.
 static int cline_bytes = 64;
 
+// Sort memrefs by address.
 static void bubble_sort_memrefs(mem_ref_t *const mem_refs, const int num_mrefs) {
     for (int i = 0; i < num_mrefs - 1; i++) {
         bool swapped = false;
@@ -153,7 +150,7 @@ static void bubble_sort_memrefs(mem_ref_t *const mem_refs, const int num_mrefs) 
     }
 }
 
-// Function to count unique elements
+// Function to count unique addresses in a mem_ref vector.
 static int count_unique_memrefs(mem_ref_t *const mem_refs, const int num_mrefs) {
     if (num_mrefs == 0) {
         return 0;
@@ -171,6 +168,8 @@ static int count_unique_memrefs(mem_ref_t *const mem_refs, const int num_mrefs) 
     return count;
 }
 
+// Count the number of different cache lines accessed by the last gather/scatter
+// instruction.
 static void memtrace(void *drcontext) {
     per_thread_t *data = drmgr_get_tls_field(drcontext, tls_idx);
     mem_ref_t *buf_ptr = BUF_PTR(data->seg_base);
@@ -408,7 +407,7 @@ static dr_emit_flags_t event_app_instruction(void *drcontext,
 
     per_thread_t *data = drmgr_get_tls_field(drcontext, tls_idx);
 
-    /* Insert code to add an entry for each app instruction. */
+    /* Insert code to add an entry for each gather/scatter app instruction. */
     /* Use the drmgr_orig_app_instr_* interface to properly handle our own use
      * of drutil_expand_rep_string() and drx_expand_scatter_gather() (as well
      * as another client/library emulating the instruction stream).
@@ -425,13 +424,13 @@ static dr_emit_flags_t event_app_instruction(void *drcontext,
             return DR_EMIT_DEFAULT; // Ignore the instruction.
         }
     }
-    // This is a memory reference. We only care about it if it comes from a
+    // This is a memory reference. We only care about it if it comes after a
     // gather or scatter.
     else if (!data->last_inst_was_gatscat) {
         return DR_EMIT_DEFAULT;
     }
 
-    // Before starting with a new instruction, dump the info of the previous one.
+    // Before start processing a new instruction, finish with the last one.
     /* insert code to call clean_call for processing the buffer */
     if (/* XXX i#1698: there are constraints for code between ldrex/strex pairs,
          * so we minimize the instrumentation in between by skipping the clean
@@ -571,6 +570,8 @@ static void event_exit(void) {
                    ngats_that_access_nlines[i]);
     }
 
+    dr_fprintf(STDOUT, "\n");
+
     for (int i = 0; i <= last_non_zero; i++) {
         dr_fprintf(STDOUT,
                    "Number of scatters that access %d cache lines: %lu\n",
@@ -605,8 +606,8 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char *argv[]) {
     /* We need 2 reg slots beyond drreg's eflags slots => 3 slots */
     drreg_options_t ops = {sizeof(ops), 3, false};
     dr_set_client_name(
-        "'GatherScatterCoalescingCount' client based on DynamoRIO",
-        "https://github.com/LorienLV/gatherscatter-coalescing-count");
+        "'GatherScatterCoalescingReport' client based on DynamoRIO",
+        "https://github.com/LorienLV/gatherscatter-coalescing-report");
 
     if (argc > 1) {
         if (argc == 2) {
