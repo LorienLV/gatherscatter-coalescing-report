@@ -24,12 +24,12 @@ To execute the client, use the following command:
 
 ```
 # Replace "DYNAMORIO_FOLDER" with the actual path to DynamoRIO's root folder and "YOUR_APP" with the application you want to analyze.
-DYNAMORIO_FOLDER/bin64/ drrun -c ./build/libgatherscatter_coalescing_report.so -- YOUR_APP
+DYNAMORIO_FOLDER/bin64/drrun -c ./build/libgatherscatter_coalescing_report.so -- YOUR_APP
 ```
 
 The GatherScatterCoalescingReport by default assumes a cache line size of 64 bytes, but you can manually set the size of the cache line:
 ```
-DYNAMORIO_FOLDER/bin64/ drrun -c ./build/libgatherscatter_coalescing_report.so CACHE_SIZE_BYTES -- YOUR_APP
+DYNAMORIO_FOLDER/bin64/drrun -c ./build/libgatherscatter_coalescing_report.so CACHE_SIZE_BYTES -- YOUR_APP
 ```
 
 ## Example Output
