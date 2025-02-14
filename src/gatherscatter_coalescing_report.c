@@ -563,7 +563,14 @@ static void event_exit(void) {
         }
     }
 
-    for (int i = 0; i <= last_non_zero; i++) {
+    if (ngats_that_access_nlines[0] != 0 || nscats_that_access_nlines[0] != 0) {
+        dr_fprintf(STDERR,
+                   "Error: there are gathers or scatters that access 0 cache "
+                   "lines.\n");
+        dr_abort();
+    }
+
+    for (int i = 1; i <= last_non_zero; i++) {
         dr_fprintf(STDOUT,
                    "Number of gathers that access %d cache lines: %lu\n",
                    i,
@@ -572,7 +579,7 @@ static void event_exit(void) {
 
     dr_fprintf(STDOUT, "\n");
 
-    for (int i = 0; i <= last_non_zero; i++) {
+    for (int i = 1; i <= last_non_zero; i++) {
         dr_fprintf(STDOUT,
                    "Number of scatters that access %d cache lines: %lu\n",
                    i,
