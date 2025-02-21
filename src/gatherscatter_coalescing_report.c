@@ -103,6 +103,9 @@ typedef struct {
     uint64 *ngats_that_access_nlines;
     uint64 *nscats_that_access_nlines;
 
+    uint64 nsimd_no_gatscat;
+    uint64 nscalar;
+
     bool last_inst_was_gatscat;
 } per_thread_t;
 
@@ -112,6 +115,8 @@ static void *mutex;        /* for multithread support */
 // Global version of per thread counters.
 static uint64 *ngats_that_access_nlines;
 static uint64 *nscats_that_access_nlines;;
+static uint64 nsimd_no_gatscat;
+static uint64 nscalar;
 
 /* Allocated TLS slot offsets */
 enum {
@@ -204,7 +209,7 @@ static void memtrace(void *drcontext) {
     BUF_PTR(data->seg_base) = data->buf_base;
 }
 
-/* clean_call dumps the memory reference info to the log file */
+/* clean_call count the number of different cache lines accessed by the last gatscat */
 static void clean_call(void) {
     void *drcontext = dr_get_current_drcontext();
     memtrace(drcontext);
@@ -407,7 +412,6 @@ static dr_emit_flags_t event_app_instruction(void *drcontext,
 
     per_thread_t *data = drmgr_get_tls_field(drcontext, tls_idx);
 
-    /* Insert code to add an entry for each gather/scatter app instruction. */
     /* Use the drmgr_orig_app_instr_* interface to properly handle our own use
      * of drutil_expand_rep_string() and drx_expand_scatter_gather() (as well
      * as another client/library emulating the instruction stream).
@@ -415,36 +419,55 @@ static dr_emit_flags_t event_app_instruction(void *drcontext,
 
     instr_t *instr_fetch = drmgr_orig_app_instr_for_fetch(drcontext);
 
-    if (instr_fetch != NULL) {
+    /* insert code to the corresponding clean_call */
+    /* XXX i#1698: there are constraints for code between ldrex/strex pairs,
+     * so we minimize the instrumentation in between by skipping the clean
+     * call. As we're only inserting instrumentation on a memory reference,
+     * and the app should be avoiding memory accesses in between the
+     * ldrex...strex, the only problematic point should be before the strex.
+     * However, there is still a chance that the instrumentation code may
+     * clear the exclusive monitor state. Using a fault to handle a full
+     * buffer should be more robust, and the forthcoming buffer filling API
+     * (i#513) will provide that.
+     */
+    if (instr_fetch != NULL &&
+        IF_AARCHXX_OR_RISCV64_ELSE(!instr_is_exclusive_store(instr_operands), true)) {
+
         if (instr_is_gather(instr_fetch) || instr_is_scatter(instr_fetch)) {
+            // Before start processing a new gatter/scatter instruction, finish with the
+            // last one.
             data->last_inst_was_gatscat = true;
+            dr_insert_clean_call(drcontext, bb, where, (void *)clean_call, false, 0);
+        }
+        else if (instr_get_category(instr_fetch) == DR_INSTR_CATEGORY_SIMD) {
+            // This is a SIMD instruction that is not a gather or scatter.
+            data->last_inst_was_gatscat = false;
+            drx_insert_counter_update(drcontext, bb, where,
+                                      (dr_spill_slot_t)(SPILL_SLOT_MAX + 1),
+                                      IF_AARCHXX_OR_RISCV64_((dr_spill_slot_t)(SPILL_SLOT_MAX + 1))
+                                      &data->nsimd_no_gatscat,
+                                      1,
+                                      0);
+            // Just count it and return.
+            return DR_EMIT_DEFAULT;
         }
         else {
+            // This is a scalar instruction.
             data->last_inst_was_gatscat = false;
-            return DR_EMIT_DEFAULT; // Ignore the instruction.
+            drx_insert_counter_update(drcontext, bb, where,
+                                      (dr_spill_slot_t)(SPILL_SLOT_MAX + 1),
+                                      IF_AARCHXX_OR_RISCV64_((dr_spill_slot_t)(SPILL_SLOT_MAX + 1))
+                                      &data->nscalar,
+                                      1,
+                                      0);
+            // Just count it and return.
+            return DR_EMIT_DEFAULT;
         }
     }
-    // This is a memory reference. We only care about it if it comes after a
-    // gather or scatter.
-    else if (!data->last_inst_was_gatscat) {
+    else if (instr_fetch == NULL && !data->last_inst_was_gatscat) {
+        // This is a memory reference. We only care about it if it comes after a
+        // gather or scatter.
         return DR_EMIT_DEFAULT;
-    }
-
-    // Before start processing a new instruction, finish with the last one.
-    /* insert code to call clean_call for processing the buffer */
-    if (/* XXX i#1698: there are constraints for code between ldrex/strex pairs,
-         * so we minimize the instrumentation in between by skipping the clean
-         * call. As we're only inserting instrumentation on a memory reference,
-         * and the app should be avoiding memory accesses in between the
-         * ldrex...strex, the only problematic point should be before the strex.
-         * However, there is still a chance that the instrumentation code may
-         * clear the exclusive monitor state. Using a fault to handle a full
-         * buffer should be more robust, and the forthcoming buffer filling API
-         * (i#513) will provide that.
-         */
-        instr_fetch != NULL &&
-        IF_AARCHXX_OR_RISCV64_ELSE(!instr_is_exclusive_store(instr_operands), true)) {
-            dr_insert_clean_call(drcontext, bb, where, (void *)clean_call, false, 0);
     }
 
     // Instrument the instruction.
@@ -525,6 +548,8 @@ static void event_thread_init(void *drcontext) {
         data->ngats_that_access_nlines[i] = 0;
         data->nscats_that_access_nlines[i] = 0;
     }
+    data->nsimd_no_gatscat = 0;
+    data->nscalar = 0;
 
     DR_ASSERT(data->seg_base != NULL && data->buf_base != NULL);
     /* put buf_base to TLS as starting buf_ptr */
@@ -541,6 +566,9 @@ static void event_thread_exit(void *drcontext) {
         ngats_that_access_nlines[i] += data->ngats_that_access_nlines[i];
         nscats_that_access_nlines[i] += data->nscats_that_access_nlines[i];
     }
+
+    nsimd_no_gatscat += data->nsimd_no_gatscat;
+    nscalar += data->nscalar;
 
     dr_mutex_unlock(mutex);
 
@@ -570,23 +598,34 @@ static void event_exit(void) {
         dr_abort();
     }
 
+    uint64 total_gats = 0;
     for (int i = 1; i <= last_non_zero; i++) {
         dr_fprintf(STDOUT,
                    "Number of gathers that access %d cache lines: %lu\n",
                    i,
                    ngats_that_access_nlines[i]);
+        total_gats += ngats_that_access_nlines[i];
     }
-
     dr_fprintf(STDOUT, "\n");
 
+    uint64 total_scats = 0;
     for (int i = 1; i <= last_non_zero; i++) {
         dr_fprintf(STDOUT,
                    "Number of scatters that access %d cache lines: %lu\n",
                    i,
                    nscats_that_access_nlines[i]);
+        total_scats += nscats_that_access_nlines[i];
     }
 
+    dr_fprintf(STDOUT, "\n");
 
+    dr_fprintf(STDOUT, "Total number of gathers: %lu\n", total_gats);
+    dr_fprintf(STDOUT, "Total number of scatters: %lu\n", total_scats);
+    dr_fprintf(STDOUT,
+               "Number of SIMD instructions that are not gathers or scatters: "
+               "%lu\n",
+               nsimd_no_gatscat);
+    dr_fprintf(STDOUT, "Number of scalar instructions: %lu\n", nscalar);
 
     if (!dr_raw_tls_cfree(tls_offs, MEMTRACE_TLS_COUNT))
         DR_ASSERT(false);
@@ -660,6 +699,8 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char *argv[]) {
         ngats_that_access_nlines[i] = 0;
         nscats_that_access_nlines[i] = 0;
     }
+    nsimd_no_gatscat = 0;
+    nscalar = 0;
 
     tls_idx = drmgr_register_tls_field();
     DR_ASSERT(tls_idx != -1);

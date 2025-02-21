@@ -56,4 +56,9 @@ Number of scatters that access 5 cache lines: 523
 Number of scatters that access 6 cache lines: 636
 Number of scatters that access 7 cache lines: 532
 Number of scatters that access 8 cache lines: 453
+
+Total number of gathers: 5124
+Total number of scatters: 4125
+Number of SIMD instructions that are not gathers or scatters: 24141
+Number of scalar instructions: 13641
 ```
