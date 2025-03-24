@@ -447,7 +447,7 @@ static dr_emit_flags_t event_app_instruction(void *drcontext,
                                       IF_AARCHXX_OR_RISCV64_((dr_spill_slot_t)(SPILL_SLOT_MAX + 1))
                                       &data->nsimd_no_gatscat,
                                       1,
-                                      0);
+                                      DRX_COUNTER_64BIT);
             // Just count it and return.
             return DR_EMIT_DEFAULT;
         }
@@ -459,7 +459,7 @@ static dr_emit_flags_t event_app_instruction(void *drcontext,
                                       IF_AARCHXX_OR_RISCV64_((dr_spill_slot_t)(SPILL_SLOT_MAX + 1))
                                       &data->nscalar,
                                       1,
-                                      0);
+                                      DRX_COUNTER_64BIT);
             // Just count it and return.
             return DR_EMIT_DEFAULT;
         }
@@ -619,13 +619,13 @@ static void event_exit(void) {
 
     dr_fprintf(STDOUT, "\n");
 
-    dr_fprintf(STDOUT, "Total number of gathers: %lu\n", total_gats);
-    dr_fprintf(STDOUT, "Total number of scatters: %lu\n", total_scats);
+    dr_fprintf(STDOUT, "Total number of gathers: %llu\n", total_gats);
+    dr_fprintf(STDOUT, "Total number of scatters: %llu\n", total_scats);
     dr_fprintf(STDOUT,
                "Number of SIMD instructions that are not gathers or scatters: "
                "%lu\n",
                nsimd_no_gatscat);
-    dr_fprintf(STDOUT, "Number of scalar instructions: %lu\n", nscalar);
+    dr_fprintf(STDOUT, "Number of scalar instructions: %llu\n", nscalar);
 
     if (!dr_raw_tls_cfree(tls_offs, MEMTRACE_TLS_COUNT))
         DR_ASSERT(false);
